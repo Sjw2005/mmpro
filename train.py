@@ -2,10 +2,21 @@ from ultralytics import RTDETR,YOLO
 from ultralytics.nn import AddModules
 
 
+import os
 import warnings
 warnings.filterwarnings('ignore')
 # 实时保存日志，断网可训↓↓↓  
 # 终端运行命令：nohup python train.py > logs/DMFNet.txt 2>&1 & echo $! > logs/train.pid && tail -f logs/DMFNet.txt
+
+os.environ.setdefault('BBOX_IOU_TYPE', 'hybrid')
+os.environ.setdefault('MPDIOU_RATIO', '0.7')
+os.environ.setdefault('CIOU_RATIO', '0.3')
+os.environ.setdefault('USE_FOCAL_LOSS', '1')
+os.environ.setdefault('FOCAL_GAMMA', '1.5')
+os.environ.setdefault('FOCAL_ALPHA', '0.25')
+os.environ.setdefault('CLS_WEIGHTS', '1.0,1.0,1.0,1.8,2.2')
+os.environ.setdefault('BOX_CLS_WEIGHTS', '1.0,1.0,1.0,1.3,1.5')
+os.environ.setdefault('CLASS_OVERSAMPLE', '3:3,4:4')
 
 model = YOLO("./results/DMFNet_MDAFP3D/weights/last.pt")
 
@@ -119,4 +130,3 @@ model.train(
     save_dir='results/DMFNet_MDAFP3D',
 )
 print("✅  模型训练完成！")
-

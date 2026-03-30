@@ -1,5 +1,7 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,15 +92,41 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses during training."""
 
-    def __init__(self, reg_max=16):
+    def __init__(self, reg_max=16, iou_type="ciou", mpdiou_ratio=0.7, ciou_ratio=0.3, box_weights=None):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.iou_type = iou_type.lower()
+        self.mpdiou_ratio = mpdiou_ratio
+        self.ciou_ratio = ciou_ratio
+        self.box_weights = box_weights
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        target_labels=None,
+    ):
         """IoU loss."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        if self.iou_type == "mpdiou":
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, MPDIoU=True)
+        elif self.iou_type == "hybrid":
+            iou_mpdiou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, MPDIoU=True)
+            iou_ciou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            iou = self.mpdiou_ratio * iou_mpdiou + self.ciou_ratio * iou_ciou
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+
+        if self.box_weights is not None and target_labels is not None:
+            cls_weight = self.box_weights[target_labels[fg_mask].long()].unsqueeze(-1)
+            weight = weight * cls_weight
+
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
@@ -120,7 +148,17 @@ class InnerBboxLoss(nn.Module):
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.inner_ratio = inner_ratio
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        target_labels=None,
+    ):
         """Inner-IoU loss."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_inner_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask],
@@ -145,7 +183,17 @@ class RotatedBboxLoss(BboxLoss):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__(reg_max)
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        target_labels=None,
+    ):
         """IoU loss."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
@@ -195,8 +243,6 @@ class v8DetectionLoss:
         self.nc = m.nc  # number of classes
         self.no = m.nc + m.reg_max * 4
 
-        # 类别加权BCE: 通过环境变量CLS_WEIGHTS控制，逗号分隔，顺序对应data.yaml类别
-        import os
         cls_weight_str = os.environ.get("CLS_WEIGHTS", "")
         if cls_weight_str:
             weights = [float(w) for w in cls_weight_str.split(",")]
@@ -206,19 +252,44 @@ class v8DetectionLoss:
             self.cls_weights = None
         self.reg_max = m.reg_max
         self.device = device
+        self.use_focal_cls = os.environ.get("USE_FOCAL_LOSS", "0").lower() in {"1", "true", "yes", "on"}
+        self.focal_gamma = float(os.environ.get("FOCAL_GAMMA", "1.5"))
+        self.focal_alpha = float(os.environ.get("FOCAL_ALPHA", "0.25"))
+
+        box_weight_str = os.environ.get("BOX_CLS_WEIGHTS", "")
+        if box_weight_str:
+            weights = [float(w) for w in box_weight_str.split(",")]
+            self.box_weights = torch.tensor(weights, device=device)
+            print(f"  [BoxWeight] 启用类别加权Box Loss: {dict(zip(range(len(weights)), weights))}")
+        else:
+            self.box_weights = None
+
+        self.iou_type = os.environ.get("BBOX_IOU_TYPE", "ciou").lower()
+        self.mpdiou_ratio = float(os.environ.get("MPDIOU_RATIO", "0.7"))
+        self.ciou_ratio = float(os.environ.get("CIOU_RATIO", "0.3"))
+        print(
+            f"  [BoxLoss] iou_type={self.iou_type}, mpdiou_ratio={self.mpdiou_ratio}, ciou_ratio={self.ciou_ratio}"
+        )
+        if self.use_focal_cls:
+            print(f"  [ClsLoss] 启用Focal Loss: gamma={self.focal_gamma}, alpha={self.focal_alpha}")
 
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
 
         # Inner-IoU: 通过环境变量INNER_IOU_RATIO控制，默认"0"表示使用标准CIoU
-        import os
         inner_ratio_str = os.environ.get("INNER_IOU_RATIO", "0")
         inner_ratio = float(inner_ratio_str)
         if inner_ratio > 0:
             self.bbox_loss = InnerBboxLoss(m.reg_max, inner_ratio=inner_ratio).to(device)
         else:
-            self.bbox_loss = BboxLoss(m.reg_max).to(device)
+            self.bbox_loss = BboxLoss(
+                m.reg_max,
+                iou_type=self.iou_type,
+                mpdiou_ratio=self.mpdiou_ratio,
+                ciou_ratio=self.ciou_ratio,
+                box_weights=self.box_weights,
+            ).to(device)
 
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
@@ -292,7 +363,16 @@ class v8DetectionLoss:
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        cls_raw = self.bce(pred_scores, target_scores.to(dtype))  # [batch*anchors, nc]
+        target_scores_dtype = target_scores.to(dtype)
+        if self.use_focal_cls:
+            cls_raw = F.binary_cross_entropy_with_logits(pred_scores, target_scores_dtype, reduction="none")
+            pred_prob = pred_scores.sigmoid()
+            p_t = target_scores_dtype * pred_prob + (1 - target_scores_dtype) * (1 - pred_prob)
+            modulating_factor = (1.0 - p_t) ** self.focal_gamma
+            alpha_factor = target_scores_dtype * self.focal_alpha + (1 - target_scores_dtype) * (1 - self.focal_alpha)
+            cls_raw = cls_raw * modulating_factor * alpha_factor
+        else:
+            cls_raw = self.bce(pred_scores, target_scores_dtype)  # [batch*anchors, nc]
         if self.cls_weights is not None:
             cls_raw = cls_raw * self.cls_weights
         loss[1] = cls_raw.sum() / target_scores_sum  # BCE
@@ -301,7 +381,14 @@ class v8DetectionLoss:
         if fg_mask.sum():
             target_bboxes /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                target_labels=target_scores.argmax(-1),
             )
 
         loss[0] *= self.hyp.box  # box gain

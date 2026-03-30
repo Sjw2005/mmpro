@@ -1,6 +1,7 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
 import json
+import os
 from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -62,6 +63,46 @@ class YOLODataset(BaseDataset):
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, **kwargs)
+
+    def apply_class_oversampling(self, labels):
+        """Duplicate images that contain minority classes based on env config."""
+        if not self.augment:
+            return labels
+
+        oversample_cfg = os.environ.get("CLASS_OVERSAMPLE", "")
+        if not oversample_cfg:
+            return labels
+
+        class_repeats = {}
+        for item in oversample_cfg.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            cls_id, repeat = item.split(":", 1)
+            class_repeats[int(cls_id)] = max(int(repeat), 1)
+        if not class_repeats:
+            return labels
+
+        sampled_labels = []
+        sampled_im_files = []
+        extra = 0
+        for im_file, label in zip(self.im_files, labels):
+            sampled_labels.append(label)
+            sampled_im_files.append(im_file)
+            cls_ids = label.get("cls")
+            if cls_ids is None or len(cls_ids) == 0:
+                continue
+            cls_ids = {int(x) for x in np.asarray(cls_ids).reshape(-1).tolist()}
+            repeat = max((class_repeats[c] for c in cls_ids if c in class_repeats), default=1)
+            for _ in range(repeat - 1):
+                sampled_labels.append(label.copy())
+                sampled_im_files.append(im_file)
+                extra += 1
+
+        if extra:
+            LOGGER.info(f"{self.prefix}Class oversampling enabled, added {extra} repeated samples.")
+            self.im_files = sampled_im_files
+        return sampled_labels
 
     def cache_labels(self, path=Path("./labels.cache")):
         """
@@ -169,7 +210,7 @@ class YOLODataset(BaseDataset):
                 lb["segments"] = []
         if len_cls == 0:
             LOGGER.warning(f"WARNING ⚠️ No labels found in {cache_path}, training may not work correctly. {HELP_URL}")
-        return labels
+        return self.apply_class_oversampling(labels)
 
     def build_transforms(self, hyp=None):
         """Builds and appends transforms to the list."""
