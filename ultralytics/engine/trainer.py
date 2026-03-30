@@ -706,7 +706,8 @@ class BaseTrainer:
                     "batch",
                     "device",
                     "close_mosaic",
-                ):  # allow arg updates to reduce memory or update device on resume
+                    "epochs",
+                ):  # allow arg updates to reduce memory, device, or total epochs on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
 

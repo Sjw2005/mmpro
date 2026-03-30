@@ -14,13 +14,7 @@ RESULTS_DIR = "results"
 CLASS_NAMES = ["car", "bus", "van", "truck", "freight_car"]
 
 MODELS = [
-    "DMFNet_SPDConv",
-    "DMFNet_DySample",
-    "DMFNet_InnerIoU",
-    "DMFNet_LSKA",
     "DMFNet_MDAFP3D",
-    "DMFNet_MDAFP3D_128",
-    "DMFNet_MDAFP3D_Conv1x1",
 ]
 
 
